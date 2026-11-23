@@ -1,0 +1,7 @@
+{
+  "appId": "com.personal.mangatranslator",
+  "appName": "Manga Translator",
+  "webDir": "dist",
+  "backgroundColor": "#1F5F8B",
+  "server": { "androidScheme": "https" }
+}

@@ -1,0 +1,7 @@
+node_modules
+dist
+dist-apk
+android
+public/fonts/FiraGO-*.ttf
+signing/custom.jks
+*.log

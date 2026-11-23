@@ -1,0 +1,105 @@
+import { useSyncExternalStore } from 'react';
+
+export interface Settings {
+  // Gemini
+  apiKey: string;
+  primaryModel: string;
+  fallbackModel: string;
+  temperature: number;
+  maxOutputTokens: number;
+  retries: number;
+  timeoutSec: number;
+  relaxSafety: boolean;
+  // การแปล
+  useOcr: boolean;
+  sendImage: boolean;
+  bubblesOnly: boolean;
+  keepHonorifics: boolean;
+  tone: 'casual' | 'neutral' | 'formal';
+  contextSharing: boolean;
+  contextPages: number;
+  maxImageSide: number;
+  jpegQuality: number;
+  importMaxSide: number;
+  // การวางข้อความ
+  font: string;
+  textColor: string;
+  strokeColor: string;
+  strokePct: number;
+  disableStroke: boolean;
+  align: 'left' | 'center' | 'right';
+  lineHeight: number;
+  maxFontPct: number;
+  minFontPx: number;
+  eraseGrow: number;
+  bubbleFill: 'auto' | 'white' | 'none';
+}
+
+export const DEFAULTS: Settings = {
+  apiKey: '',
+  primaryModel: 'gemini-3.5-flash-lite',
+  fallbackModel: 'gemini-3.8-flash',
+  temperature: 0.3,
+  maxOutputTokens: 8192,
+  retries: 2,
+  timeoutSec: 90,
+  relaxSafety: true,
+  useOcr: true,
+  sendImage: true,
+  bubblesOnly: true,
+  keepHonorifics: false,
+  tone: 'casual',
+  contextSharing: true,
+  contextPages: 2,
+  maxImageSide: 1600,
+  jpegQuality: 0.85,
+  importMaxSide: 3200,
+  font: 'Itim',
+  textColor: '#111111',
+  strokeColor: '#ffffff',
+  strokePct: 0,
+  disableStroke: false,
+  align: 'center',
+  lineHeight: 1.15,
+  maxFontPct: 4.5,
+  minFontPx: 10,
+  eraseGrow: 1,
+  bubbleFill: 'auto',
+};
+
+const KEY = 'mt.settings.v1';
+
+function load(): Settings {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
+  } catch {
+    /* ignore */
+  }
+  return { ...DEFAULTS };
+}
+
+let current = load();
+const subs = new Set<() => void>();
+
+export const getSettings = () => current;
+
+export function updateSettings(patch: Partial<Settings>) {
+  current = { ...current, ...patch };
+  try {
+    localStorage.setItem(KEY, JSON.stringify(current));
+  } catch {
+    /* ignore */
+  }
+  subs.forEach((f) => f());
+}
+
+export function useSettings(): Settings {
+  return useSyncExternalStore(
+    (cb) => {
+      subs.add(cb);
+      return () => subs.delete(cb);
+    },
+    () => current,
+  );
+}
