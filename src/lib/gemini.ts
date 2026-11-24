@@ -33,6 +33,7 @@ export interface PageInput {
   ocr: OcrRegion[];
   prevSummary: string;
   prevLines: { source: string; thai: string }[];
+  extra?: string;
 }
 
 export interface RawRegion {
@@ -62,12 +63,14 @@ You receive, in this order:
 4. TRANSLATION INSTRUCTIONS - options for this job.
 
 Rules:
-- Output one region per speech bubble, thought bubble, narration box, sign or sound effect. Merge OCR fragments that belong together (list their ids in ocr_ids), split blocks that contain several bubbles, and add text OCR missed (ocr_ids = []).
+- Output one region per speech bubble, thought bubble, narration box, caption, sign or sound effect. Merge OCR fragments only when they are touching parts of the SAME text block. NEVER merge text blocks that are far apart or differ in colour, size or style (for example small white vertical text and large pink outlined text are different regions). Split blocks that contain several bubbles, and add text OCR missed (ocr_ids = []).
+- Large stylised dialogue drawn directly over artwork (visual-novel / CG captions, coloured or outlined text, vertical columns) is dialogue too: translate every readable block.
+- Every OCR id must appear in exactly one region's ocr_ids, or in ignored_ocr_ids if it is not translatable text (watermark, page number, logo, random artwork pattern).
 - List regions in the reading order given in the instructions.
 - source_text: the corrected original text of the region.
 - translation: natural, fluent Thai that fits the speaker's personality, gender, relationship and mood. Never translate word-for-word, never add notes, explanations or romanization. Keep it short enough to fit inside the bubble. Use "\\n" only for deliberate line breaks.
 - Ignore watermarks, page numbers, scanlator credits and site logos.
-- box_2d: tight box around the ORIGINAL text of the region (this area will be erased). bubble_box_2d: the empty inner area of the bubble / caption box where Thai text can be placed (same as box_2d when there is no bubble). Both are integers [ymin, xmin, ymax, xmax] in 0-1000.
+- box_2d: tight box that covers ALL of the ORIGINAL text of the region and nothing else (this area will be erased), so one region = one visually contiguous block. bubble_box_2d: the empty inner area of the bubble / caption box where Thai text can be placed (same as box_2d when there is no bubble). Both are integers [ymin, xmin, ymax, xmax] in 0-1000.
 - page_summary: one or two short Thai sentences saying what happens on this page (it is reused as context for the next page).
 - Reply with JSON only, matching the response schema.`;
 
@@ -75,6 +78,7 @@ export const RESPONSE_SCHEMA = {
   type: 'OBJECT',
   properties: {
     page_summary: { type: 'STRING' },
+    ignored_ocr_ids: { type: 'ARRAY', items: { type: 'STRING' } },
     regions: {
       type: 'ARRAY',
       items: {
@@ -92,7 +96,7 @@ export const RESPONSE_SCHEMA = {
       },
     },
   },
-  required: ['page_summary', 'regions'],
+  required: ['page_summary', 'ignored_ocr_ids', 'regions'],
 };
 
 const DIR_TEXT = {
@@ -156,6 +160,7 @@ export function buildRequest(inp: PageInput) {
       ? 'Scope: translate dialogue only (speech, thought, narration, signs that matter). Skip sound effects and decorative background text.'
       : 'Scope: translate dialogue AND sound effects (kind="sfx", keep them short and punchy). Skip unreadable decorative text.',
     `Extra instructions from the user: ${p.customPrompt.trim() || '(none)'}`,
+    ...(inp.extra ? [`Correction note: ${inp.extra}`] : []),
   ].join('\n');
 
   const parts: Record<string, unknown>[] = [];
@@ -165,15 +170,20 @@ export function buildRequest(inp: PageInput) {
   parts.push({ text: `[3] CONTEXT / GLOSSARY\n<context_glossary>\n${JSON.stringify(buildContext(inp))}\n</context_glossary>` });
   parts.push({ text: `[4] TRANSLATION INSTRUCTIONS\n<translation_instructions>\n${instructions}\n</translation_instructions>` });
 
+  const generationConfig: Record<string, unknown> = {
+    temperature: s.temperature,
+    maxOutputTokens: s.maxOutputTokens,
+    responseMimeType: 'application/json',
+    responseSchema: RESPONSE_SCHEMA,
+  };
+  // Reasoning effort: 'none' = ไม่ส่งค่านี้เลย (ใช้ค่าเริ่มต้นของโมเดล)
+  if (s.reasoning === 'low' || s.reasoning === 'medium' || s.reasoning === 'high') {
+    generationConfig.thinkingConfig = { thinkingLevel: s.reasoning };
+  }
   const body: Record<string, unknown> = {
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents: [{ role: 'user', parts }],
-    generationConfig: {
-      temperature: s.temperature,
-      maxOutputTokens: s.maxOutputTokens,
-      responseMimeType: 'application/json',
-      responseSchema: RESPONSE_SCHEMA,
-    },
+    generationConfig,
   };
   if (s.relaxSafety) {
     body.safetySettings = ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(
@@ -261,7 +271,7 @@ async function post(model: string, body: unknown, s: Settings, outer?: AbortSign
   }
 }
 
-function parseResult(text: string): { regions: RawRegion[]; summary: string } {
+function parseResult(text: string): { regions: RawRegion[]; summary: string; ignored: string[] } {
   let t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
   let j: any;
   try {
@@ -289,13 +299,14 @@ function parseResult(text: string): { regions: RawRegion[]; summary: string } {
       bubble_box_2d: Array.isArray(r.bubble_box_2d) ? r.bubble_box_2d.map(Number) : [],
     }))
     .sort((a: any, b: any) => a.order - b.order);
-  return { regions, summary: String(j.page_summary ?? '') };
+  const ignored: string[] = Array.isArray(j.ignored_ocr_ids) ? j.ignored_ocr_ids.map(String) : [];
+  return { regions, summary: String(j.page_summary ?? ''), ignored };
 }
 
 export async function translateWithGemini(
   inp: PageInput,
   signal?: AbortSignal,
-): Promise<{ regions: RawRegion[]; summary: string; model: string }> {
+): Promise<{ regions: RawRegion[]; summary: string; ignored: string[]; model: string }> {
   const s = inp.settings;
   if (!s.apiKey.trim()) throw new GeminiError('ยังไม่ได้ใส่ Gemini API Key (ไปที่ ตั้งค่า)', 'key');
   const body = buildRequest(inp);

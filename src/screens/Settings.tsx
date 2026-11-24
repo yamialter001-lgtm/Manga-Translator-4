@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { db } from '../lib/db';
 import { importFontFile, listFontNames } from '../lib/fonts';
 import { getLastPreview, listModels, pingModel, sampleRequestPreview } from '../lib/gemini';
-import { DEFAULTS, updateSettings, useSettings } from '../lib/settings';
-import { back } from '../nav';
+import { DEFAULTS, updateSettings, useSettings, type Reasoning } from '../lib/settings';
+import { goUp } from '../nav';
 import { Icon, Modal, Num, Range, Toggle, toast, Field } from '../ui';
 
 interface TestRow {
@@ -67,7 +67,7 @@ export default function SettingsScreen() {
   return (
     <div className="screen">
       <header className="topbar">
-        <button className="iconbtn" onClick={back} aria-label="กลับ">
+        <button className="iconbtn" onClick={goUp} aria-label="กลับ">
           <Icon n="back" />
         </button>
         <h1 className="title">ตั้งค่า</h1>
@@ -118,6 +118,25 @@ export default function SettingsScreen() {
             <Num value={s.maxOutputTokens} min={512} max={65536} step={512} onChange={(v) => updateSettings({ maxOutputTokens: v })} />
           </Field>
         </div>
+        <Field
+          label="Reasoning Effort (ระดับการคิดของโมเดล)"
+          hint={
+            s.reasoning === 'none'
+              ? 'ไม่ส่งค่านี้ไปให้ Gemini — ใช้ค่าเริ่มต้นของโมเดลนั้นๆ'
+              : s.reasoning === 'low'
+                ? 'คิดน้อย เร็วและประหยัดที่สุด'
+                : s.reasoning === 'medium'
+                  ? 'คิดแบบสมดุล'
+                  : 'คิดลึกที่สุด ช้าลงและกินโทเคนมาก — โทเคนที่ใช้คิดนับรวมใน Max output tokens (แนะนำตั้งอย่างน้อย 16384) และอาจต้องเพิ่ม Timeout'
+          }
+        >
+          <select value={s.reasoning} onChange={(e) => updateSettings({ reasoning: e.target.value as Reasoning })}>
+            <option value="none">ไม่คิด (ไม่ส่งค่า ใช้ค่าเริ่มต้นของโมเดล)</option>
+            <option value="low">ต่ำ</option>
+            <option value="medium">กลาง</option>
+            <option value="high">สูง</option>
+          </select>
+        </Field>
         <div className="row2">
           <Field label="ลองใหม่ (ครั้ง)">
             <Num value={s.retries} min={0} max={6} onChange={(v) => updateSettings({ retries: v })} />
@@ -178,7 +197,9 @@ export default function SettingsScreen() {
         <Toggle label="ปิดขอบตัวอักษรทั้งหมด" checked={s.disableStroke} onChange={(v) => updateSettings({ disableStroke: v })} />
         <Range label="ระยะบรรทัด" value={s.lineHeight} min={0.9} max={1.8} step={0.05} onChange={(v) => updateSettings({ lineHeight: v })} />
         <Range label="ขนาดตัวอักษรสูงสุด (% ความกว้างหน้า)" value={s.maxFontPct} min={1.5} max={10} step={0.1} onChange={(v) => updateSettings({ maxFontPct: v })} />
-        <Range label="ขนาดตัวอักษรต่ำสุด" value={s.minFontPx} min={6} max={30} step={1} onChange={(v) => updateSettings({ minFontPx: v })} show={(v) => `${v}px`} />
+        <Range label="ขนาดตัวอักษรต่ำสุด (% ความกว้างหน้า)" value={s.minFontPct} min={0.8} max={4} step={0.1} onChange={(v) => updateSettings({ minFontPct: v })} />
+        <Toggle label="ใช้สีตัวอักษรเดิมของภาพ" hint="ตรวจสีตัวอักษรและขอบเดิม แล้วใช้กับข้อความไทยตอนแปล" checked={s.autoColor} onChange={(v) => updateSettings({ autoColor: v })} />
+        <Range label="ความไวในการตรวจตัวอักษรที่จะลบ (ต่ำ = ลบมากขึ้น)" value={s.maskThreshold} min={12} max={80} step={1} onChange={(v) => updateSettings({ maskThreshold: v })} />
         <Range label="ตัวคูณพื้นที่ลบ (Inpaint)" value={s.eraseGrow} min={0.3} max={3} step={0.1} onChange={(v) => updateSettings({ eraseGrow: v })} />
         <Field label="พื้นหลังที่ลบข้อความ">
           <select value={s.bubbleFill} onChange={(e) => updateSettings({ bubbleFill: e.target.value as typeof s.bubbleFill })}>

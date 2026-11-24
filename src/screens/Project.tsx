@@ -5,7 +5,7 @@ import { GeminiError } from '../lib/gemini';
 import { importFiles } from '../lib/importer';
 import { translatePage } from '../lib/pipeline';
 import { getSettings, useSettings } from '../lib/settings';
-import { go } from '../nav';
+import { go, goUp, useBackHandler } from '../nav';
 import type { Page, Project } from '../types';
 import { BlobImg, Icon, Modal, toast } from '../ui';
 import ContextPanel from './ContextPanel';
@@ -30,6 +30,13 @@ export default function ProjectScreen({ projectId }: { projectId: string }) {
   const fileArc = useRef<HTMLInputElement>(null);
   const saveTimer = useRef(0);
   const aborter = useRef<AbortController | null>(null);
+
+  /* ปุ่มย้อนกลับของโทรศัพท์ ระหว่างมีงานทำอยู่: แปลทั้งหมดถามก่อนหยุด / นำเข้า-ส่งออกรอให้เสร็จ (ป้องกันกดพลาดแล้วงานหาย) */
+  useBackHandler(() => {
+    if (!job) return false;
+    if (job.cancel && confirm('กำลังทำงานอยู่ ต้องการหยุดงานนี้หรือไม่?')) job.cancel();
+    return true;
+  });
 
   const setAllPages = (list: Page[]) => {
     pagesRef.current = list;
@@ -84,7 +91,7 @@ export default function ProjectScreen({ projectId }: { projectId: string }) {
       setJob({ label: `กำลังแปลหน้า ${pg.index + 1}`, i: k, n: todo.length, cancel: () => ctrl.abort() });
       try {
         const r = await translatePage(project, pg, getSettings(), pagesRef.current, ctrl.signal);
-        const upd: Page = { ...pg, regions: r.regions, summary: r.summary, model: r.model, status: 'done', error: undefined };
+        const upd: Page = { ...pg, regions: r.regions, summary: r.summary, model: r.model, ocr: r.ocr, brush: [], status: 'done', error: undefined };
         await db.putPage(upd);
         setAllPages(pagesRef.current.map((x) => (x.id === upd.id ? upd : x)));
         ok++;
@@ -165,7 +172,7 @@ export default function ProjectScreen({ projectId }: { projectId: string }) {
   return (
     <div className="screen">
       <header className="topbar">
-        <button className="iconbtn" onClick={() => go('/')} aria-label="กลับ">
+        <button className="iconbtn" onClick={goUp} aria-label="กลับ">
           <Icon n="back" />
         </button>
         <h1 className="title">{project.title}</h1>

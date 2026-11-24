@@ -3,14 +3,19 @@ import { db } from '../lib/db';
 import { exportPageImage } from '../lib/exporter';
 import { BUILTIN_FONTS, listFontNames } from '../lib/fonts';
 import { translatePage } from '../lib/pipeline';
-import { PageRenderer, resolveStyle } from '../lib/render';
+import { resolveStyle, type PageRenderer } from '../lib/render';
+import { acquireRenderer, dropRenderer, prefetchPage, releaseRenderer } from '../lib/renderers';
 import { useSettings } from '../lib/settings';
 import { clamp, uid } from '../lib/util';
-import { go, replace } from '../nav';
-import { KIND_LABEL, type Box, type Kind, type Page, type Project, type Region, type RegionStyle } from '../types';
+import { goUp, replace, useBackHandler } from '../nav';
+import { KIND_LABEL, type Box, type Kind, type Page, type Project, type Region, type RegionStyle, type Stroke } from '../types';
 import { Icon, Modal, Range, toast } from '../ui';
 
 type Target = 'area' | 'erase';
+interface Snap {
+  regions: Region[];
+  brush: Stroke[];
+}
 interface Drag {
   id: string;
   target: Target;
@@ -24,6 +29,8 @@ interface Drag {
 }
 
 const ZOOMS = [1, 1.6, 2.4, 3.5];
+const BARS_KEY = 'mt.barsMin';
+const BRUSH_COLOR = '#d23a6b';
 const boxStyle = (b: Box): CSSProperties => ({
   top: `${b[0] / 10}%`,
   left: `${b[1] / 10}%`,
@@ -45,6 +52,17 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
   const [sheet, setSheet] = useState<'' | 'list' | 'menu'>('');
   const [drag, setDrag] = useState<{ id: string; target: Target; box: Box } | null>(null);
   const [fonts, setFonts] = useState<string[]>(BUILTIN_FONTS);
+  const [tool, setTool] = useState<'select' | 'brush'>('select');
+  const [brushSize, setBrushSize] = useState(22);
+  const [showOcr, setShowOcr] = useState(false);
+  const [rendering, setRendering] = useState(false);
+  const [barsMin, setBarsMin] = useState(() => {
+    try {
+      return localStorage.getItem(BARS_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
 
   const pageRef = useRef<Page | null>(null);
   const pendingRef = useRef<Page | null>(null);
@@ -53,9 +71,30 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
-  const hist = useRef({ past: [] as Region[][], future: [] as Region[][], key: '', at: 0 });
+  const hist = useRef({ past: [] as Snap[], future: [] as Snap[], key: '', at: 0 });
+  const brushRef = useRef<HTMLCanvasElement>(null);
+  const strokeRef = useRef<{ pts: number[]; rect: DOMRect; drawn: number } | null>(null);
+  const aliveRef = useRef(true);
+  const prefetchTimer = useRef(0);
   const saveTimer = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+
+  /* ปุ่มย้อนกลับของโทรศัพท์: ยกเลิกงานที่กำลังทำ → ออกจากโหมดแปรง → ยกเลิกเลือกกล่อง (หน้าต่างป๊อปอัปจัดการเอง) */
+  useBackHandler(() => {
+    if (busy) {
+      abortRef.current?.abort();
+      return true;
+    }
+    if (tool === 'brush') {
+      setTool('select');
+      return true;
+    }
+    if (sel) {
+      setSel(null);
+      return true;
+    }
+    return false;
+  });
 
   const flushSave = async () => {
     clearTimeout(saveTimer.current);
@@ -72,21 +111,20 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
   /* ---------- โหลดหน้า ---------- */
   useEffect(() => {
     let dead = false;
+    aliveRef.current = true;
     listFontNames().then(setFonts);
     (async () => {
+      // โหลดภาพ/ตัวเรนเดอร์ (ใช้แคชถ้ามี) ไปพร้อมกับอ่านข้อมูลโปรเจกต์
+      const rendP = acquireRenderer(pageId);
+      rendP.catch(() => undefined);
       const [proj, list] = await Promise.all([db.getProject(projectId), db.listPages(projectId)]);
       const pg = list.find((p) => p.id === pageId);
       if (dead) return;
       if (!proj || !pg) return replace(`/p/${projectId}`);
-      const blob = await db.getBlob(pageId);
-      if (!blob) throw new Error('ไม่พบไฟล์ภาพของหน้านี้');
-      const bmp = await createImageBitmap(blob);
-      if (dead) {
-        bmp.close?.();
-        return;
-      }
-      rendererRef.current = new PageRenderer(bmp, bmp.width, bmp.height);
-      setDims({ w: bmp.width, h: bmp.height });
+      const r = await rendP;
+      if (dead) return;
+      rendererRef.current = r;
+      setDims({ w: r.W, h: r.H });
       setProject(proj);
       setPages(list);
       pageRef.current = pg;
@@ -94,21 +132,49 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     })().catch((e) => toast((e as Error).message, 'error'));
     return () => {
       dead = true;
+      aliveRef.current = false;
       abortRef.current?.abort();
+      clearTimeout(prefetchTimer.current);
       flushSave().then(() => db.syncStats(projectId));
-      rendererRef.current?.dispose();
+      releaseRenderer(pageId);
       rendererRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, pageId]);
+
+  /* เตรียมหน้าถัดไป/ก่อนหน้าไว้ล่วงหน้าตอนว่าง เพื่อให้สลับหน้าได้ทันที */
+  const schedulePrefetch = () => {
+    clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = window.setTimeout(async () => {
+      const cur = pageRef.current;
+      if (!cur) return;
+      const i = pages.findIndex((p) => p.id === cur.id);
+      if (i < 0) return;
+      for (const n of [pages[i + 1], pages[i - 1]]) {
+        if (!n || !aliveRef.current) continue;
+        try {
+          await prefetchPage(n, settings, () => aliveRef.current);
+        } catch {
+          /* ข้าม: เตรียมไว้ล่วงหน้าไม่สำเร็จไม่เป็นไร */
+        }
+      }
+    }, 700);
+  };
 
   /* ---------- วาดภาพ ---------- */
   useEffect(() => {
     const r = rendererRef.current;
     const c = canvasRef.current;
     if (!r || !c || !page) return;
-    r.render(c, page.regions, settings, showTr);
-  }, [dims, page?.regions, showTr, settings]);
+    setRendering(true);
+    r.render(c, page.regions, page.brush ?? [], settings, showTr).then((ok) => {
+      if (!ok || !aliveRef.current) return; // ถูกแทนที่ด้วยคำสั่งใหม่ (จะวาดต่อเอง)
+      setRendering(false);
+      if (!strokeRef.current) clearBrushPreview(); // ลบพรีวิวเส้นแปรงเมื่อภาพที่ลบจริงพร้อมแล้ว
+      schedulePrefetch();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dims, page?.regions, page?.brush, showTr, settings]);
 
   /* ---------- แก้ไข + ประวัติ (Undo/Redo) ---------- */
   const apply = (regions: Region[], extra?: Partial<Page>) => {
@@ -125,7 +191,7 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     const h = hist.current;
     const now = Date.now();
     if (!(key && h.key === key && now - h.at < 900)) {
-      h.past.push(p.regions);
+      h.past.push({ regions: p.regions, brush: p.brush ?? [] });
       if (h.past.length > 80) h.past.shift();
     }
     h.key = key;
@@ -138,18 +204,18 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     const prev = h.past.pop();
     const p = pageRef.current;
     if (!prev || !p) return;
-    h.future.push(p.regions);
+    h.future.push({ regions: p.regions, brush: p.brush ?? [] });
     h.key = '';
-    apply(prev);
+    apply(prev.regions, { brush: prev.brush });
   };
   const redo = () => {
     const h = hist.current;
     const next = h.future.pop();
     const p = pageRef.current;
     if (!next || !p) return;
-    h.past.push(p.regions);
+    h.past.push({ regions: p.regions, brush: p.brush ?? [] });
     h.key = '';
-    apply(next);
+    apply(next.regions, { brush: next.brush });
   };
 
   const regions = page?.regions ?? [];
@@ -175,6 +241,7 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
       text: 'ข้อความ',
       erase: [cy - 40, cx - 100, cy + 40, cx + 100].map(Math.round) as Box,
       area: [cy - 55, cx - 120, cy + 55, cx + 120].map(Math.round) as Box,
+      widen: false,
       fill,
       hidden: false,
       style: {},
@@ -200,7 +267,7 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     setBusy('กำลังอ่านข้อความและส่งให้ Gemini...');
     try {
       const r = await translatePage(project, p, settings, pages.map((x) => (x.id === p.id ? p : x)), ctrl.signal);
-      commit(r.regions, '', { summary: r.summary, model: r.model, error: undefined });
+      commit(r.regions, '', { summary: r.summary, model: r.model, ocr: r.ocr, error: undefined });
       setSel(null);
       setShowTr(true);
       toast(`แปลเสร็จ ${r.regions.length} กล่อง · ${r.model}${r.ocrCount ? ` · OCR ${r.ocrCount} บล็อก` : ''}`);
@@ -251,7 +318,8 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     const d = dragRef.current;
     dragRef.current = null;
     setDrag(null);
-    if (d && d.cur.some((v, i) => v !== d.box[i])) patch(d.id, { [d.target]: d.cur } as Partial<Region>);
+    if (d && d.cur.some((v, i) => v !== d.box[i]))
+      patch(d.id, (d.target === 'erase' ? { erase: d.cur, parts: undefined } : { area: d.cur }) as Partial<Region>);
   };
   const dragProps = (r: Region) => ({
     onPointerDown: (e: PointerEvent) => beginDrag(e, r, 'move'),
@@ -303,18 +371,109 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
     pendingRef.current = null;
     clearTimeout(saveTimer.current);
     await db.deletePage(page.id);
+    dropRenderer(page.id);
     let i = 0;
     for (const p of pages.filter((x) => x.id !== page.id)) {
       if (p.index !== i) await db.putPage({ ...p, index: i });
       i++;
     }
-    go(`/p/${projectId}`);
+    replace(`/p/${projectId}`);
   };
   const clearAll = () => {
     setSheet('');
     if (regions.length && confirm('ลบกล่องข้อความทั้งหมดในหน้านี้?')) {
       commit([]);
       setSel(null);
+    }
+  };
+
+  /* ---------- แปรงลบ ---------- */
+  // พรีวิวเส้นแปรงวาดบนผืนย่อ (กว้างไม่เกิน 1000px) และวาดเฉพาะช่วงที่เพิ่มใหม่ ไม่วาดซ้ำทั้งเส้น
+  const prepBrushCanvas = () => {
+    const c = brushRef.current;
+    if (!c || !dims) return null;
+    const pw = Math.min(dims.w, 1000);
+    const ph = Math.max(1, Math.round((dims.h * pw) / dims.w));
+    if (c.width !== pw || c.height !== ph) {
+      c.width = pw;
+      c.height = ph;
+    }
+    return c;
+  };
+  const clearBrushPreview = () => {
+    const c = brushRef.current;
+    if (c && c.width) c.getContext('2d')!.clearRect(0, 0, c.width, c.height);
+  };
+  const paintBrush = () => {
+    const st = strokeRef.current;
+    const c = prepBrushCanvas();
+    if (!st || !c) return;
+    const x = c.getContext('2d')!;
+    const sx = c.width / 1000;
+    const sy = c.height / 1000;
+    const lw = (brushSize / 1000) * c.width;
+    x.strokeStyle = BRUSH_COLOR;
+    x.fillStyle = BRUSH_COLOR;
+    x.lineWidth = lw;
+    x.lineCap = 'round';
+    x.lineJoin = 'round';
+    const n = st.pts.length;
+    x.beginPath();
+    if (n === 2) {
+      x.arc(st.pts[0] * sx, st.pts[1] * sy, lw / 2, 0, Math.PI * 2);
+      x.fill();
+    } else {
+      const start = Math.max(0, st.drawn - 2);
+      x.moveTo(st.pts[start] * sx, st.pts[start + 1] * sy);
+      for (let i = start + 2; i + 1 < n; i += 2) x.lineTo(st.pts[i] * sx, st.pts[i + 1] * sy);
+      x.stroke();
+    }
+    st.drawn = n;
+  };
+  const brushPos = (e: PointerEvent, rect: DOMRect): [number, number] => [
+    clamp(((e.clientX - rect.left) / rect.width) * 1000, 0, 1000),
+    clamp(((e.clientY - rect.top) / rect.height) * 1000, 0, 1000),
+  ];
+  const brushDown = (e: PointerEvent) => {
+    const sh = sheetRef.current;
+    if (!sh || !dims) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const rect = sh.getBoundingClientRect();
+    const p = brushPos(e, rect);
+    strokeRef.current = { pts: [p[0], p[1]], rect, drawn: 0 };
+    paintBrush();
+  };
+  const brushMove = (e: PointerEvent) => {
+    const st = strokeRef.current;
+    if (!st || !dims) return;
+    const p = brushPos(e, st.rect);
+    const n = st.pts.length;
+    if (Math.hypot(((p[0] - st.pts[n - 2]) * dims.w) / 1000, ((p[1] - st.pts[n - 1]) * dims.h) / 1000) < 3) return;
+    st.pts.push(p[0], p[1]);
+    paintBrush();
+  };
+  const brushUp = () => {
+    const st = strokeRef.current;
+    strokeRef.current = null;
+    if (!st) return;
+    const stroke: Stroke = { pts: st.pts.map((v) => Math.round(v * 10) / 10), size: brushSize };
+    commit(regions, '', { brush: [...(pageRef.current?.brush ?? []), stroke] });
+  };
+  const undoStroke = () => commit(regions, '', { brush: (pageRef.current?.brush ?? []).slice(0, -1) });
+  const enterBrush = () => {
+    setSel(null);
+    setShowTr(true);
+    setTool(tool === 'brush' ? 'select' : 'brush');
+  };
+
+  const toggleBars = () => {
+    const v = !barsMin;
+    setBarsMin(v);
+    try {
+      localStorage.setItem(BARS_KEY, v ? '1' : '0');
+    } catch {
+      /* ignore */
     }
   };
 
@@ -332,7 +491,7 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
   return (
     <div className="screen editor">
       <header className="topbar">
-        <button className="iconbtn" onClick={() => go(`/p/${projectId}`)} aria-label="กลับ">
+        <button className="iconbtn" onClick={goUp} aria-label="กลับ">
           <Icon n="back" />
         </button>
         <h1 className="title">
@@ -354,12 +513,14 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
           <canvas ref={canvasRef} width={dims.w} height={dims.h} className="pagecanvas" />
           <div className="overlay">
             {showTr &&
+              tool === 'select' &&
               regions.map((r) => {
                 const isSel = r.id === sel;
                 const boxOf = (t: Target) => (drag && drag.id === r.id && drag.target === t ? drag.box : r[t]);
                 const order: Target[] = isSel ? (target === 'area' ? ['erase', 'area'] : ['area', 'erase']) : ['area'];
                 return (
                   <Fragment key={r.id}>
+                    {isSel && r.parts && r.parts.map((pb, k) => <div key={'p' + k} className="bx part" style={boxStyle(pb)} />)}
                     {order.map((t) => {
                       const active = isSel && t === target;
                       return (
@@ -385,11 +546,38 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
                   </Fragment>
                 );
               })}
+            {showOcr && page.ocr?.map((o) => (
+              <div key={o.id} className="bx ocr" style={boxStyle(o.box)}>
+                <i>{o.id}</i>
+              </div>
+            ))}
+            <canvas ref={brushRef} className="brushcv" />
+            {tool === 'brush' && <div className="brushpad" onPointerDown={brushDown} onPointerMove={brushMove} onPointerUp={brushUp} onPointerCancel={brushUp} />}
           </div>
         </div>
       </div>
 
-      {selected && st && (
+      <button className="foldbar" onClick={toggleBars} aria-label={barsMin ? 'แสดงแถบเมนู' : 'ย่อแถบเมนู'}>
+        <Icon n={barsMin ? 'chevUp' : 'chevDown'} size={18} />
+        {barsMin && <span>{tool === 'brush' ? 'โหมดแปรงลบ · ' : ''}แตะเพื่อแสดงเมนู</span>}
+      </button>
+
+      {!barsMin && tool === 'brush' && (
+        <div className="panel">
+          <Range label="ขนาดแปรง" value={brushSize} min={6} max={80} step={1} onChange={setBrushSize} show={(v) => `${(v / 10).toFixed(1)}%`} />
+          <p className="hint">ระบายทับตัวอักษรที่ยังเหลือ แอปจะลบและเติมพื้นหลังให้</p>
+          <div className="row2">
+            <button className="btn small" disabled={!page.brush?.length} onClick={undoStroke}>
+              ลบเส้นล่าสุด
+            </button>
+            <button className="btn small primary" onClick={() => setTool('select')}>
+              เสร็จ
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!barsMin && tool === 'select' && selected && st && (
         <div className="panel">
           <div className="panel-head">
             <select value={selected.kind} onChange={(e) => patch(selected.id, { kind: e.target.value as Kind })}>
@@ -482,6 +670,14 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
             </label>
           )}
           <Range label="ความหนาขอบ" value={st.strokePct} min={0} max={30} step={1} onChange={(v) => patchStyle(selected.id, { strokePct: v })} />
+          <label className="toggle">
+            <span>
+              <span className="lbl">ขยายความกว้างอัตโนมัติ</span>
+              <span className="hint">สำหรับข้อความแนวตั้งเดิมที่กรอบแคบและสูง</span>
+            </span>
+            <input type="checkbox" checked={!!selected.widen} onChange={(e) => patch(selected.id, { widen: e.target.checked })} />
+            <i className="sw" />
+          </label>
           <div className="row2">
             <button className="btn small" onClick={applyToPage}>
               ใช้สไตล์กับทั้งหน้า
@@ -493,36 +689,49 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
         </div>
       )}
 
-      <nav className="dock">
-        <button className="dk primary" onClick={doTranslate}>
-          <Icon n="translate" />
-          <span>แปลหน้านี้</span>
-        </button>
-        <button className="dk" onClick={() => setShowTr(!showTr)}>
-          <Icon n="eye" />
-          <span>{showTr ? 'ดูต้นฉบับ' : 'ดูคำแปล'}</span>
-        </button>
-        <button className="dk" onClick={addRegion}>
-          <Icon n="box" />
-          <span>เพิ่มกล่อง</span>
-        </button>
-        <button className="dk" disabled={!h.past.length} onClick={undo}>
-          <Icon n="undo" />
-          <span>ย้อน</span>
-        </button>
-        <button className="dk" disabled={!h.future.length} onClick={redo}>
-          <Icon n="redo" />
-          <span>ทำซ้ำ</span>
-        </button>
-        <button className="dk" onClick={() => setSheet('list')}>
-          <Icon n="list" />
-          <span>รายการ</span>
-        </button>
-        <button className="dk" onClick={() => setZoom((zoom + 1) % ZOOMS.length)}>
-          <Icon n="zoom" />
-          <span>{ZOOMS[zoom]}×</span>
-        </button>
-      </nav>
+      {!barsMin && (
+        <nav className="dock">
+          <button className="dk primary" onClick={doTranslate}>
+            <Icon n="translate" />
+            <span>แปลหน้านี้</span>
+          </button>
+          <button className="dk" onClick={() => setShowTr(!showTr)}>
+            <Icon n="eye" />
+            <span>{showTr ? 'ดูต้นฉบับ' : 'ดูคำแปล'}</span>
+          </button>
+          <button className="dk" onClick={addRegion}>
+            <Icon n="box" />
+            <span>เพิ่มกล่อง</span>
+          </button>
+          <button className={'dk' + (tool === 'brush' ? ' on' : '')} onClick={enterBrush}>
+            <Icon n="pen" />
+            <span>แปรงลบ</span>
+          </button>
+          <button className="dk" disabled={!h.past.length} onClick={undo}>
+            <Icon n="undo" />
+            <span>ย้อน</span>
+          </button>
+          <button className="dk" disabled={!h.future.length} onClick={redo}>
+            <Icon n="redo" />
+            <span>ทำซ้ำ</span>
+          </button>
+          <button className="dk" onClick={() => setSheet('list')}>
+            <Icon n="list" />
+            <span>รายการ</span>
+          </button>
+          <button className="dk" onClick={() => setZoom((zoom + 1) % ZOOMS.length)}>
+            <Icon n="zoom" />
+            <span>{ZOOMS[zoom]}×</span>
+          </button>
+        </nav>
+      )}
+
+      {rendering && (
+        <div className="renderchip">
+          <i className="spin sm" />
+          <span>กำลังลบข้อความ…</span>
+        </div>
+      )}
 
       {busy && (
         <div className="busy">
@@ -567,6 +776,12 @@ export default function Editor({ projectId, pageId }: { projectId: string; pageI
           </button>
           <button className="btn wide" onClick={() => saveImage(false)}>
             <Icon n="image" size={18} /> บันทึกภาพต้นฉบับ
+          </button>
+          <button className="btn wide" onClick={() => { setShowOcr(!showOcr); setSheet(''); }}>
+            <Icon n="search" size={18} /> {showOcr ? 'ซ่อนกรอบ OCR' : 'แสดงกรอบ OCR (ตรวจตำแหน่ง)'}
+          </button>
+          <button className="btn wide" disabled={!page.brush?.length} onClick={() => { commit(regions, '', { brush: [] }); setSheet(''); }}>
+            <Icon n="pen" size={18} /> ล้างรอยแปรงทั้งหมด
           </button>
           <button className="btn wide" onClick={clearAll}>
             <Icon n="box" size={18} /> ล้างกล่องทั้งหมด

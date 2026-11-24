@@ -1,5 +1,6 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { clamp } from './lib/util';
+import { useBackHandler } from './nav';
 
 /* ---------------- ไอคอน ---------------- */
 const P: Record<string, ReactNode> = {
@@ -23,6 +24,9 @@ const P: Record<string, ReactNode> = {
   book: <path d="M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2zM4 19a2 2 0 002 2h13" />,
   zoom: (<><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3M11 8v6M8 11h6" /></>),
   box: <rect x="4" y="5" width="16" height="14" rx="2" strokeDasharray="3 3" />,
+  pen: <path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" />,
+  chevUp: <path d="M6 15l6-6 6 6" />,
+  chevDown: <path d="M6 9l6 6 6-6" />,
   spark: <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z" />,
 };
 
@@ -75,6 +79,11 @@ export function ToastHost() {
 
 /* ---------------- Modal / Sheet ---------------- */
 export function Modal({ title, onClose, children, full }: { title: string; onClose: () => void; children: ReactNode; full?: boolean }) {
+  // ปุ่มย้อนกลับของโทรศัพท์ = ปิดหน้าต่างนี้ (หน้าต่างที่เปิดทีหลังอยู่บนสุดจึงถูกปิดก่อน)
+  useBackHandler(() => {
+    onClose();
+    return true;
+  });
   return (
     <div className="scrim" onClick={onClose}>
       <div className={'modal' + (full ? ' full' : '')} onClick={(e) => e.stopPropagation()}>

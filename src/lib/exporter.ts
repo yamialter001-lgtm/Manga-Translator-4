@@ -31,7 +31,7 @@ export async function exportArchive(
     const p = pages[i];
     const src = await db.getBlob(p.id);
     if (!src) continue;
-    const out = await renderToBlob(src, p.regions, s, opts.translated);
+    const out = await renderToBlob(src, p, s, opts.translated);
     const f = new ZipPassThrough(`${String(i + 1).padStart(4, '0')}.jpg`);
     zip.add(f);
     f.push(new Uint8Array(await out.arrayBuffer()), true);
@@ -46,7 +46,7 @@ export async function exportArchive(
 export async function exportPageImage(project: Project, page: Page, s: Settings, translated: boolean): Promise<string> {
   const src = await db.getBlob(page.id);
   if (!src) throw new Error('ไม่พบไฟล์ภาพ');
-  const out = await renderToBlob(src, page.regions, s, translated);
+  const out = await renderToBlob(src, page, s, translated);
   const sink = new FileSink(`${safeName(project.title)}-${String(page.index + 1).padStart(3, '0')}-${Date.now()}.jpg`, 'image/jpeg');
   await sink.write(new Uint8Array(await out.arrayBuffer()));
   return sink.finish();

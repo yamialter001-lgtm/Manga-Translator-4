@@ -1,5 +1,8 @@
 import { useSyncExternalStore } from 'react';
 
+export type Reasoning = 'none' | 'low' | 'medium' | 'high';
+export const REASONING_LEVELS: Reasoning[] = ['none', 'low', 'medium', 'high'];
+
 export interface Settings {
   // Gemini
   apiKey: string;
@@ -10,6 +13,8 @@ export interface Settings {
   retries: number;
   timeoutSec: number;
   relaxSafety: boolean;
+  /** Reasoning effort: none = ไม่ส่งค่า (ใช้ค่าเริ่มต้นของโมเดล) */
+  reasoning: Reasoning;
   // การแปล
   useOcr: boolean;
   sendImage: boolean;
@@ -30,7 +35,9 @@ export interface Settings {
   align: 'left' | 'center' | 'right';
   lineHeight: number;
   maxFontPct: number;
-  minFontPx: number;
+  minFontPct: number;
+  maskThreshold: number;
+  autoColor: boolean;
   eraseGrow: number;
   bubbleFill: 'auto' | 'white' | 'none';
 }
@@ -44,6 +51,7 @@ export const DEFAULTS: Settings = {
   retries: 2,
   timeoutSec: 90,
   relaxSafety: true,
+  reasoning: 'none',
   useOcr: true,
   sendImage: true,
   bubblesOnly: true,
@@ -61,8 +69,10 @@ export const DEFAULTS: Settings = {
   disableStroke: false,
   align: 'center',
   lineHeight: 1.15,
-  maxFontPct: 4.5,
-  minFontPx: 10,
+  maxFontPct: 3.6,
+  minFontPct: 1.8,
+  maskThreshold: 30,
+  autoColor: true,
   eraseGrow: 1,
   bubbleFill: 'auto',
 };
@@ -72,7 +82,11 @@ const KEY = 'mt.settings.v1';
 function load(): Settings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
+    if (raw) {
+      const s = { ...DEFAULTS, ...JSON.parse(raw) } as Settings;
+      if (!REASONING_LEVELS.includes(s.reasoning)) s.reasoning = 'none';
+      return s;
+    }
   } catch {
     /* ignore */
   }

@@ -39,11 +39,25 @@ export interface Region {
   kind: Kind;
   source: string;
   text: string;
-  erase: Box; // พื้นที่ข้อความต้นฉบับที่จะลบ
+  erase: Box; // พื้นที่ข้อความต้นฉบับที่จะลบ (กรอบรวม)
+  parts?: Box[]; // ถ้ามี: ลบเฉพาะกรอบย่อยเหล่านี้ (ข้อความหลายก้อนที่อยู่ห่างกัน)
   area: Box; // พื้นที่วางข้อความไทย
+  widen?: boolean; // ขยายความกว้างอัตโนมัติเมื่อกรอบแคบและสูง (ข้อความแนวตั้งเดิม)
   fill: string; // 'auto' | 'none' | '#rrggbb'
   hidden: boolean;
   style: Partial<RegionStyle>;
+}
+
+/** เส้นแปรงลบ: pts = [x0,y0,x1,y1,...] สเกล 0-1000, size = ความหนา (‰ ของความกว้างหน้า) */
+export interface Stroke {
+  pts: number[];
+  size: number;
+}
+
+export interface OcrBlock {
+  id: string;
+  box: Box;
+  text: string;
 }
 
 export interface Page {
@@ -58,6 +72,8 @@ export interface Page {
   summary?: string;
   model?: string;
   regions: Region[];
+  brush?: Stroke[];
+  ocr?: OcrBlock[];
   thumb?: Blob;
 }
 
